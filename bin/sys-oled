@@ -49,14 +49,14 @@ def _load_sections_with_prefix(config : ConfigParser, prefix: str, default : Lis
     Returns:
         List[dict]: Matching sections as an ordered dictionary or a list of dictionaries.
     """
-    result = default[:]
+    result = []
     # Collect matching sections
     for section in config.sections():
         if section.startswith(prefix):
             section_data = {key: value for key, value in config.items(section)}
             result.append(section_data)
 
-    return result
+    return result if len(result) > 0 else default[:]
 
 if os.path.isfile(config_file):
     config = ConfigParser()

@@ -1,0 +1,5 @@
+# Check the array drive temperatures every 5 minutes and power off if too hot.
+# See /usr/local/bin/drive-temp-guard and shutdown_drive_temp in /etc/sys-oled.conf.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root /usr/local/bin/drive-temp-guard

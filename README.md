@@ -37,3 +37,19 @@ storage2_path= /mnt/md0
 ```
 
 In the above example, we are displaying **sd** (SDcard) usage which is the rootfs mounted on *'/'*. We are also displaying **md0** (RAID array) that is mounted on *'/mnt/mnd0'*.
+
+### Thermal shutdown guard
+
+`install.sh` also installs `drive-temp-guard`, run by cron every 5 minutes. It reads
+`drive_devices` and `shutdown_drive_temp` from */etc/sys-oled.conf* and powers the machine
+off if any drive is hotter than the threshold. Sleeping drives are never woken.
+
+When that happens a note is written to */var/lib/sys-oled/thermal-shutdown.txt* and shown at
+the next login (via */etc/update-motd.d*). Remove the file to clear the notice. Each event is
+also appended to */var/log/drive-temp-guard.log* and the journal.
+
+Check the current readings by hand with:
+
+```
+sudo drive-temp-guard -v
+```

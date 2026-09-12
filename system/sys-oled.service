@@ -2,7 +2,7 @@
 Description=OLED Display
 
 [Service]
-ExecStart=/usr/bin/python3 /usr/local/bin/sys-oled --display ssd1306 --i2c-port 0 --rotate 2
+ExecStart=/usr/local/bin/sys-oled --display ssd1306 --i2c-port 0 --rotate 2
 
 [Install]
 WantedBy=multi-user.target

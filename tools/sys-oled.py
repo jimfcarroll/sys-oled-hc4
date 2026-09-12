@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import OrderedDict
+from configparser import ConfigParser
+from datetime import datetime
+from typing import Any, List
+
+import psutil
+from luma.core import cmdline, error
+from luma.core.render import canvas
+from PIL import Image, ImageFont
+
+# Load presets
+contrast = 255
+refresh = 10
+show_logo = 'yes'
+net_name = 'eth0'
+
+# emergency signal thresholds
+max_cpu_temp = 90.0
+max_drive_temp = 55.0
+show_drive_temp = 'yes'
+drive_devices = ['/dev/sdc', '/dev/sdd']
+low_fan_rpm = -99 # disabled
+show_cpu_temp = 'yes'
+show_cpu_load = 'yes'
+show_fan_rpm = 'yes'
+show_info = 'yes'
+storage_sections = [{ "name": "sd", "dir": "/" }]
+show_load_average = []
+show_disk_info = 'yes'
+
+# Get the number of CPU cores
+cpu_count = os.cpu_count()
+
+# Load config file
+config_file = '/etc/sys-oled.conf'
+
+def _load_sections_with_prefix(config : ConfigParser, prefix: str, default : List[Any]):
+    """
+    Loads sections from a ConfigParser object that match a given prefix.
+
+    Args:
+        config (configparser.ConfigParser): The existing ConfigParser object.
+        prefix (str): The prefix to match section names (e.g., "disk.").
+
+    Returns:
+        List[dict]: Matching sections as an ordered dictionary or a list of dictionaries.
+    """
+    result = []
+    # Collect matching sections
+    for section in config.sections():
+        if section.startswith(prefix):
+            section_data = {key: value for key, value in config.items(section)}
+            result.append(section_data)
+
+    return result if len(result) > 0 else default[:]
+
+if os.path.isfile(config_file):
+    config = ConfigParser()
+    config.read(config_file)
+    contrast = int(config.get('main', 'contrast'))
+    refresh = float(config.get('main', 'refresh'))
+    show_logo = config.get('main', 'show_logo')
+    show_cpu_temp = config.get('main', 'show_cpu_temp') if config.has_option('main', 'show_cpu_temp') else show_cpu_temp
+    show_cpu_load = config.get('main', 'show_cpu_load') if config.has_option('main', 'show_cpu_load') else show_cpu_load
+    show_fan_rpm = config.get('main', 'show_fan_rpm') if config.has_option('main', 'show_fan_rpm') else show_fan_rpm
+    show_info = config.get('main', 'show_info') if config.has_option('main', 'show_info') else show_info
+    show_disk_info = config.get('main', 'show_disk_info') if config.has_option('main', 'show_disk_info') else show_disk_info
+    show_drive_temp = config.get('main', 'show_drive_temp') if config.has_option('main', 'show_drive_temp') else show_drive_temp
+    max_cpu_temp = float(config.get('device', 'max_cpu_temp')) if config.has_option('device','max_cpu_temp') else max_cpu_temp
+    max_drive_temp = float(config.get('device', 'max_drive_temp')) if config.has_option('device', 'max_drive_temp') else max_drive_temp
+    if config.has_option('device', 'drive_devices'):
+        drive_devices = [d.strip() for d in config.get('device', 'drive_devices').split(',')]
+    low_fan_rpm = float(config.get('device', 'low_fan_rpm')) if config.has_option('device','low_fan_rpm') else low_fan_rpm
+    net_name = config.get('device', 'network_name') if config.has_option('device','network_name') else net_name
+    if config.has_option('main','show_load_average'):
+        show_load_average = config.get('main','show_load_average')
+        try :
+            show_load_average = [int(item.strip()) for item in show_load_average.split(",")]
+        except ValueError as e:
+            # assums the format is wrong.
+            raise ValueError("show_load_average config must be a comma separated list of integers between 0 and 2 inclusively.")
+
+        for la_index in show_load_average:
+            if la_index < 0 or la_index > 2:
+                raise ValueError("show_load_average config must be a comma separated list of integers between 0 and 2 inclusively.")
+    
+    storage_sections = _load_sections_with_prefix(config, "storage.", storage_sections)
+
+# ==============================================
+# Font settings.
+# ==============================================
+# Load font
+font_path = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                         '/usr/local/share/sys-oled', 'C&C Red Alert [INET].ttf'))
+font_size = 12
+font = ImageFont.truetype(font_path, font_size)
+font_mid_size = 18
+font_mid = ImageFont.truetype(font_path, font_mid_size)
+font_big_size = 48
+font_big = ImageFont.truetype(font_path, font_big_size)
+# ==============================================
+
+# ==============================================
+# Setup the signal handler
+def sigterm_handler():
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, sigterm_handler)
+# ==============================================
+
+def get_device(actual_args=None):
+    if actual_args is None:
+        actual_args = sys.argv[1:]
+    parser = cmdline.create_parser(description='luma.core arguments')
+    args = parser.parse_args(actual_args)
+
+    if args.config:
+        config = cmdline.load_config(args.config)
+        args = parser.parse_args(config + actual_args)
+
+    try:
+        device = cmdline.create_device(args)
+    except error.Error as e:
+        parser.error(e)
+
+    return device
+
+def bytes2human(n):
+    symbols = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
+    prefix = {}
+    for i, s in enumerate(symbols):
+        prefix[s] = 1 << (i + 1) * 10
+    for s in reversed(symbols):
+        if n >= prefix[s]:
+            value = float(n) / prefix[s]
+            if s in ['K', 'M']:
+                return '%d%s' % (int(value), s)
+            else:
+                return '%.1f%s' % (value, s)
+    return "%sB" % n
+
+def _get_fan_speeds():
+    """
+    Lookup the current fan speeds and return all of them in a dict.
+    """
+    fan_files = glob.glob('/sys/class/hwmon/hwmon*/fan*_input')
+    speeds = {}
+    for fan_file in fan_files:
+        with open(fan_file, 'r') as f:
+            fan_speed = f.read().strip()
+            speeds[fan_file] = f"{fan_speed}"
+    return speeds
+    
+def _cpu_usage():
+    load = psutil.cpu_percent(interval=None)
+    temp = psutil.sensors_temperatures()['cpu_thermal']
+    uptime = datetime.now().replace(second=0, microsecond=0) - datetime.fromtimestamp(psutil.boot_time())
+    return "ld: %s%% T: %sC up: %s" \
+           % (str(load).split('.')[0], str(temp[0].current).split('.')[0], str(uptime).split(',')[0][:-3])
+
+def _cpu_load_from_loadavg(index: int):
+    """
+    Read the 3 load CPU averages and return the one requested as a float.
+    """
+    # Read the 1-minute load average from /proc/loadavg
+    with open('/proc/loadavg', 'r') as f:
+        load_avg_1 = float(f.read().split()[index])  # Get the 1-minute load average
+
+    # Calculate the percentage load
+    cpu_load_percentage = (load_avg_1 / cpu_count) * 100.0
+
+    return cpu_load_percentage
+
+def cpu_load_average(lav_index: int):
+    """
+    Retrieve and format for display the load average requested. The load average index
+    should be 0,1 or 2.
+    """
+    load = float(_cpu_load_from_loadavg(lav_index))
+    return ("%.1f%%" if load < 10 else "%.0f%%") % float(load), float(load)
+
+def cpu_load():
+    """
+    Retrieve and format for display the current CPU load.
+    """
+    load = psutil.cpu_percent(interval=None)
+    return ("%.1f%%" if load < 10 else "%.0f%%") % load, load
+
+def cpu_temp():
+    """
+    Retrieve and format for display the current CPU temp.
+    """
+    temp = psutil.sensors_temperatures()['cpu_thermal']
+    temp = temp[0].current
+    return "%.1f\u00B0" % temp, temp
+
+_drive_temp_cache = {"t": None, "ts": 0.0}
+
+def _read_drive_temp(dev):
+    """Attr 194 via smartctl; None if standby/unreadable (never wakes a sleeping drive)."""
+    try:
+        out = subprocess.run(['smartctl', '-n', 'standby', '-A', dev],
+                             capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            f = line.split()
+            if f and f[0] == '194':
+                return int(f[9])
+    except Exception:
+        pass
+    return None
+
+def drive_temp():
+    """Hottest array drive, cached 60s. ('zzz', -1) when all asleep/unreadable."""
+    now = time.monotonic()
+    if now - _drive_temp_cache["ts"] > 60.0:
+        temps = [t for t in (_read_drive_temp(d) for d in drive_devices) if t is not None]
+        _drive_temp_cache["t"] = max(temps) if temps else None
+        _drive_temp_cache["ts"] = now
+    t = _drive_temp_cache["t"]
+    return ("zzz", -1.0) if t is None else ("%d\u00B0" % t, float(t))
+
+def fan_speed():
+    """
+    Retrieve and format for display the current main case fan speed. The assumption here
+    is that it's the only one.
+    """
+    fan_speeds = _get_fan_speeds()
+    first = next(iter(fan_speeds))
+    first = fan_speeds[first]
+    return first, int(first)
+
+def mem_usage():
+    usage = psutil.virtual_memory()
+    return "mem: %s / %s - %.0f%%" \
+           % (bytes2human(usage.used), bytes2human(usage.total), usage.percent)
+
+def disk_usage(name, dir):
+    usage = psutil.disk_usage(dir)
+    return name + ": %s / %s - %.0f%%" \
+           % (bytes2human(usage.used), bytes2human(usage.total), usage.percent)
+
+def emergency_check(device, draw_fn, interval=0.5):
+    """
+    Flashes an emergency signal on the LCD by alternating between the callable-drawn
+    content and a blank screen, until the callable returns False.
+    
+    Args:
+        device: The luma.core device object representing the LCD.
+        draw_fn: Any callable that takes the device as an argument and returns a boolean.
+                 - True: Continue flashing.
+                 - False: Stop flashing.
+        interval: The time interval in seconds between flashing (default: 0.5 seconds).
+    """
+    while True:
+        cont = draw_fn(device)
+        if not cont:
+            break  # Stop if the callable returns False
+        
+        time.sleep(interval)
+        
+        # Clear the screen (blank state)
+        with canvas(device) as draw:
+            pass  # Blank the screen
+        time.sleep(interval)
+
+def network(iface):
+    addr = psutil.net_if_addrs().get(iface, None)
+    if addr is None:
+        raise ValueError(f"Network inferface {iface} doesn't exist. Check or set your configuration for net_name to a valid network interface.")
+    return "%s: %s" \
+           % (iface, addr[0].address)
+
+def host_time():
+    now = datetime.now()
+    return "" + now.strftime("%Y-%m-%d %H:%M")
+
+def display_info(device):
+    with canvas(device) as draw:
+        draw.text((0, 0), _cpu_usage(), font=font, fill="white")
+        draw.line((0, 13) + (128, 13), fill="white")
+        draw.text((0, 15), mem_usage(), font=font, fill="white")
+        y_offset = 27
+        for storage in storage_sections[:2]:
+            draw.text((0, y_offset), disk_usage(storage['name'], storage['dir']), font=font, fill="white")
+            y_offset += 12
+        draw.text((0, y_offset), network(net_name), font=font, fill="white")
+
+def display_cpu_load(device):
+    loads, loadf = cpu_load()
+    with canvas(device) as draw:
+        draw.text((0, 5), "CPU", font=font_mid, fill="white")
+        draw.text((0, font_mid_size + 5), "load", font=font_mid, fill="white")
+        draw.text(((2 * font_mid_size), 0), loads, font=font_big, fill="white")
+        return loadf
+
+def display_cpu_load_average(device, lav_index: int):
+    loads, loadf = cpu_load_average(lav_index)
+    with canvas(device) as draw:
+        draw.text((0, 5), "CPU", font=font_mid, fill="white")
+        draw.text((0, font_mid_size + 5), f"av {lav_index}", font=font_mid, fill="white")
+        draw.text(((2 * font_mid_size), 0), loads, font=font_big, fill="white")
+        return loadf
+
+def display_temp(device):
+    temp, tempf = cpu_temp()
+    with canvas(device) as draw:
+        draw.text((0, 5), "CPU", font=font_mid, fill="white")
+        draw.text((0, font_mid_size + 5), "temp", font=font_mid, fill="white")
+        draw.text(((2 * font_mid_size), 0), temp, font=font_big, fill="white")
+        return tempf
+
+def display_drive_temp(device):
+    temp, tempf = drive_temp()
+    with canvas(device) as draw:
+        draw.text((0, 5), "HDD", font=font_mid, fill="white")
+        draw.text((0, font_mid_size + 5), "temp", font=font_mid, fill="white")
+        draw.text(((2 * font_mid_size), 0), temp, font=font_big, fill="white")
+        return tempf
+
+def display_fan_speed(device):
+    fss, fsi = fan_speed()
+    with canvas(device) as draw:
+        draw.text((0, 5), "Fan", font=font_mid, fill="white")
+        draw.text((0, font_mid_size + 5), "rpm", font=font_mid, fill="white")
+        draw.text(((2 * font_mid_size), 0), fss, font=font_big, fill="white")
+        return fsi
+
+def display_storage(device, storage: dict):
+    """
+    Determine and display the given storage details indicated by the given storage
+    section. 
+    """
+    usage = psutil.disk_usage(storage['dir'])
+    txt = "%.0f%%" % usage.percent
+    with canvas(device) as draw:
+        draw.text((0, 5), "Disk", font=font_mid, fill="white")
+        if 'name' in storage:
+            draw.text((0, font_mid_size + 5), storage['name'], font=font_mid, fill="white")
+        draw.text(((2 * font_mid_size), 0), txt, font=font_big, fill="white")
+
+def logo(device, msg):
+    img_path = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                            '/usr/local/share/sys-oled', 'armbian-oled.png'))
+    logo = Image.open(img_path).convert("RGBA")
+
+    with canvas(device) as draw:
+        draw.bitmap((0, -2), logo, fill="white")
+        draw.text((0, 50), msg, font=font_big, fill="white")
+
+# emergency callables need to return if we're still in an  emergency state
+def emergency_cpu_temp(device):
+    """
+    Display the CPU tempa nd return True if we're in an emergency state indicated by the
+    temperature being higher than the configured max. The max is 90 degrees C by default.
+    """
+    temp = display_temp(device)
+    return temp > max_cpu_temp
+
+def emergency_fan_rpm(device):
+    """
+    Display the fan RPM rate and return True if we're in an emergency state indicated by the
+    fan speed dropping below the configured min. This is disabled by default.
+    """
+    fan_speed = display_fan_speed(device)
+    return fan_speed <= low_fan_rpm
+
+def emergency_drive_temp(device):
+    """
+    Display the hottest array drive temp and return True if it exceeds the configured max.
+    The max is 55 degrees C by default. 'zzz' (-1) can never trip.
+    """
+    return display_drive_temp(device) > max_drive_temp
+
+def main():
+    while True:
+        if show_cpu_temp == 'yes':
+            emergency_check(device, emergency_cpu_temp)
+            time.sleep(refresh)
+        if show_drive_temp == 'yes':
+            emergency_check(device, emergency_drive_temp)
+            time.sleep(refresh)
+        if show_fan_rpm == 'yes':
+            emergency_check(device, emergency_fan_rpm)
+            time.sleep(refresh)
+        if show_cpu_load == 'yes':
+            display_cpu_load(device)
+            time.sleep(refresh)
+        for lav_index in show_load_average:
+            if int(lav_index) >= 0 and int(lav_index) <= 2:
+                display_cpu_load_average(device, int(lav_index))
+                time.sleep(refresh)
+        if show_disk_info == 'yes':
+            for storage in storage_sections:
+                if 'dir' in storage:
+                    display_storage(device, storage)
+                    time.sleep(refresh)
+        if show_info == 'yes':
+            display_info(device)
+            time.sleep(refresh)
+        if show_logo == "yes":
+            logo(device, host_time())
+            time.sleep(refresh / 2)
+
+if __name__ == "__main__":
+    try:
+        device = get_device()
+        device.contrast(contrast)
+        main()
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,55 @@
+#!/bin/bash
+# drive-temp-guard: poll the array drives' temperatures with smartctl and power
+# the machine off if any drive exceeds the shutdown threshold. A note is left in
+# $NOTE, which /etc/update-motd.d/99-thermal-shutdown prints at the next login.
+#
+# Reads drive_devices and shutdown_drive_temp from /etc/sys-oled.conf.
+# Run with -v to print the current readings.
+set -u
+
+CONF=/etc/sys-oled.conf
+NOTE=/var/lib/sys-oled/thermal-shutdown.txt
+LOG=/var/log/drive-temp-guard.log
+
+conf_get() {
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" 2>/dev/null | tail -n1 | sed 's/[[:space:]]*$//'
+}
+
+drives="$(conf_get drive_devices)"
+limit="$(conf_get shutdown_drive_temp)"
+drives="${drives:-/dev/sdc,/dev/sdd}"
+limit="${limit:-55}"
+
+hottest=-1
+hot_dev=""
+report=""
+IFS=',' read -ra devs <<< "$drives"
+for dev in "${devs[@]}"; do
+    dev="${dev// /}"
+    [ -z "$dev" ] && continue
+    # -n standby: never wake a sleeping drive; a sleeping drive reports nothing.
+    t="$(smartctl -n standby -A "$dev" 2>/dev/null | awk '$1 == 194 { print $10; exit }')"
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+        report+="$dev=${t}C "
+        if (( t > hottest )); then
+            hottest=$t
+            hot_dev=$dev
+        fi
+    else
+        report+="$dev=zzz "
+    fi
+done
+
+[ "${1:-}" = "-v" ] && echo "limit=${limit}C $report"
+
+if (( hottest > limit )); then
+    when="$(date '+%Y-%m-%d %H:%M:%S')"
+    msg="THERMAL SHUTDOWN $when: $hot_dev reached ${hottest}C (limit ${limit}C). Readings: $report"
+    mkdir -p "$(dirname "$NOTE")"
+    printf '%s\n' "$msg" >> "$NOTE"
+    printf '%s\n' "$msg" >> "$LOG"
+    logger -t drive-temp-guard -p daemon.crit "$msg"
+    wall "$msg" 2>/dev/null
+    sync
+    /sbin/shutdown -h now "drive-temp-guard: $hot_dev at ${hottest}C"
+fi
